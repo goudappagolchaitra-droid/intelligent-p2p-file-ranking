@@ -742,8 +742,14 @@ function Peers() {
   }
 
   useEffect(() => {
+  loadPeers();
+
+  const interval = setInterval(() => {
     loadPeers();
-  }, []);
+  }, 10000);
+
+  return () => clearInterval(interval);
+}, []);
 
   return (
     <>
@@ -1719,6 +1725,61 @@ function Protected({ children }) {
   return children;
 }
 
+// ==========================================
+// AUTOMATIC BROWSER PEER PRESENCE
+// ==========================================
+
+function BrowserPeerPresence() {
+  useEffect(() => {
+    let deviceId = localStorage.getItem("peerrank_device_id");
+
+    if (!deviceId) {
+      deviceId = crypto.randomUUID();
+      localStorage.setItem("peerrank_device_id", deviceId);
+    }
+
+    async function sendHeartbeat() {
+      if (!navigator.onLine) return;
+
+      try {
+        const response = await authFetch(
+          `${API}/peers/browser/heartbeat`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              device_id: deviceId,
+              peer_name: "Browser device"
+            })
+          }
+        );
+
+        if (!response.ok) {
+          console.error(
+            "Peer heartbeat failed:",
+            await response.text()
+          );
+          return;
+        }
+
+        console.log("PeerRank browser is online.");
+      } catch (error) {
+        console.error("Peer heartbeat error:", error);
+      }
+    }
+
+    sendHeartbeat();
+
+    const interval = setInterval(sendHeartbeat, 20000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  return null;
+}
+
 
 // ==========================================
 // WORKSPACE ROUTES
@@ -1728,6 +1789,7 @@ function Workspace() {
   return (
     <Protected>
       <Layout>
+         <BrowserPeerPresence />
 
         <Routes>
 

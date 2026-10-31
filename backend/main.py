@@ -4,7 +4,8 @@ import hashlib
 import jwt
 import secrets
 from pathlib import Path
-from uuid import uuid4
+# from uuid import uuid4
+from uuid import uuid4, uuid5, NAMESPACE_URL
 from datetime import datetime, timezone, timedelta
 
 from fastapi import (
@@ -488,7 +489,22 @@ class PeerRegistration(BaseModel):
         default=0,
         ge=0
     )
+# ==========================================
+# BROWSER PEER MODEL
+# ==========================================
 
+class BrowserPeerHeartbeat(BaseModel):
+
+    device_id: str = Field(
+        min_length=16,
+        max_length=100
+    )
+
+    peer_name: str = Field(
+        default="Browser peer",
+        min_length=2,
+        max_length=100
+    )
 
 # ==========================================
 # PEER PERFORMANCE SCORE
@@ -643,44 +659,126 @@ def peer_heartbeat(
             detail="Could not update peer heartbeat."
         )
 
-
 # ==========================================
-# GET ALL PEERS
-# UPDATE ONLINE / OFFLINE STATUS
+# AUTOMATIC BROWSER PEER REGISTRATION
 # ==========================================
 
-@app.get("/peers")
-def get_peers(
+@app.post("/peers/browser/heartbeat")
+def browser_peer_heartbeat(
+    data: BrowserPeerHeartbeat,
     current_user: dict = Depends(get_current_user)
 ):
 
     collection = get_peers_collection()
 
+    # Generate a stable peer ID for this user's browser
+    peer_id = str(
+        uuid5(
+            NAMESPACE_URL,
+            f"peerrank:{current_user['id']}:{data.device_id}"
+        )
+    )
+
+    current_time = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    peer = {
+        "id": peer_id,
+        "owner_id": current_user["id"],
+        "device_id": data.device_id,
+        "peer_name": data.peer_name.strip(),
+        "response_time_ms": 0,
+        "upload_speed_mbps": 0,
+        "availability": 100,
+        "active_transfers": 0,
+        "status": "Online",
+        "last_seen": current_time
+    }
+
     try:
 
+        collection.update_one(
+            {"_id": peer_id},
+            {
+                "$set": {
+                    key: value
+                    for key, value in peer.items()
+                    if key != "id"
+                },
+                "$setOnInsert": {
+                    "_id": peer_id
+                }
+            },
+            upsert=True
+        )
+
+        return {
+            "message": "Browser peer is online",
+            "peer": {
+                "id": peer_id,
+                "peer_name": peer["peer_name"],
+                "status": "Online",
+                "last_seen": current_time
+            }
+        }
+
+    except PyMongoError:
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not register browser peer."
+        )
+# ==========================================
+# GET ALL PEERS
+# UPDATE ONLINE / OFFLINE STATUS
+# ==========================================
+
+
+@app.get("/peers")
+def get_peers(
+    current_user: dict = Depends(get_current_user)
+):
+    collection = get_peers_collection()
+
+    try:
         now = datetime.now(timezone.utc)
 
         peers = list(
             collection.find(
                 {},
-                {"_id": 0}
+                {
+                    "_id": 1,
+                    "id": 1,
+                    "peer_name": 1,
+                    "response_time_ms": 1,
+                    "upload_speed_mbps": 1,
+                    "availability": 1,
+                    "active_transfers": 1,
+                    "status": 1,
+                    "last_seen": 1
+                }
             )
         )
 
+        public_peers = []
+
         for peer in peers:
+            peer_id = peer.get("id") or str(peer["_id"])
 
             last_seen = peer.get("last_seen")
+            status = "Unknown"
 
             if last_seen:
-
                 try:
-
-                    last_seen_time = datetime.fromisoformat(
-                        last_seen
-                    )
+                    if isinstance(last_seen, datetime):
+                        last_seen_time = last_seen
+                    else:
+                        last_seen_time = datetime.fromisoformat(
+                            str(last_seen).replace("Z", "+00:00")
+                        )
 
                     if last_seen_time.tzinfo is None:
-
                         last_seen_time = last_seen_time.replace(
                             tzinfo=timezone.utc
                         )
@@ -690,34 +788,31 @@ def get_peers(
                     ).total_seconds()
 
                     status = (
-                        "Online"
-                        if elapsed <= 60
-                        else "Offline"
+                        "Online" if elapsed <= 60 else "Offline"
                     )
 
-                    peer["status"] = status
-
                     collection.update_one(
-                        {"id": peer["id"]},
-                        {
-                            "$set": {
-                                "status": status
-                            }
-                        }
+                        {"_id": peer["_id"]},
+                        {"$set": {"status": status}}
                     )
 
                 except (ValueError, TypeError):
+                    status = "Unknown"
 
-                    peer["status"] = "Unknown"
+            public_peers.append({
+                "id": peer_id,
+                "peer_name": peer.get("peer_name", "Unknown peer"),
+                "response_time_ms": peer.get("response_time_ms", 0),
+                "upload_speed_mbps": peer.get("upload_speed_mbps", 0),
+                "availability": peer.get("availability", 0),
+                "active_transfers": peer.get("active_transfers", 0),
+                "status": status,
+                "last_seen": last_seen
+            })
 
-            else:
-
-                peer["status"] = "Unknown"
-
-        return peers
+        return public_peers
 
     except PyMongoError:
-
         raise HTTPException(
             status_code=500,
             detail="Could not retrieve peers."
