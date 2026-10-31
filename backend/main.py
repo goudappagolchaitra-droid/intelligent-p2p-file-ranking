@@ -2,7 +2,7 @@
 import os
 import hashlib
 import jwt
-
+import secrets
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
@@ -13,7 +13,8 @@ from fastapi import (
     UploadFile,
     File,
     Form,
-    Depends
+    Depends,
+        Header
 )
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -36,7 +37,7 @@ load_dotenv()
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-
+PEER_AGENT_SECRET = os.getenv("PEER_AGENT_SECRET")
 
 # ==========================================
 # APPLICATION
@@ -151,16 +152,54 @@ def get_current_user(
         )
 
 # ==========================================
+# PEER AGENT AUTHENTICATION
+# ==========================================
+
+def verify_peer_agent(
+    agent_secret: str = Header(
+        default="",
+        alias="X-Peer-Agent-Secret"
+    )
+):
+    if not PEER_AGENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="Peer agent secret is not configured."
+        )
+
+    if not agent_secret or not secrets.compare_digest(
+        agent_secret,
+        PEER_AGENT_SECRET
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid peer agent authentication."
+        )
+
+    return True
+# ==========================================
 # CORS CONFIGURATION
 # ==========================================
 
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "http://localhost:5173"
+)
+
+ALLOWED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in FRONTEND_URL.split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 # ==========================================
@@ -517,7 +556,10 @@ def calculate_peer_score(peer):
 # ==========================================
 
 @app.post("/peers/register")
-def register_peer(data: PeerRegistration):
+def register_peer(
+    data: PeerRegistration,
+    current_user: dict = Depends(get_current_user)
+):
 
     collection = get_peers_collection()
 
@@ -557,7 +599,10 @@ def register_peer(data: PeerRegistration):
 # ==========================================
 
 @app.post("/peers/heartbeat/{peer_id}")
-def peer_heartbeat(peer_id: str):
+def peer_heartbeat(
+    peer_id: str,
+    agent_authenticated: bool = Depends(verify_peer_agent)
+):
 
     collection = get_peers_collection()
 
@@ -605,7 +650,9 @@ def peer_heartbeat(peer_id: str):
 # ==========================================
 
 @app.get("/peers")
-def get_peers():
+def get_peers(
+    current_user: dict = Depends(get_current_user)
+):
 
     collection = get_peers_collection()
 
@@ -682,7 +729,9 @@ def get_peers():
 # ==========================================
 
 @app.get("/peers/ranking")
-def get_ranking():
+def get_ranking(
+    current_user: dict = Depends(get_current_user)
+):
 
     collection = get_peers_collection()
 
@@ -778,12 +827,13 @@ def get_ranking():
 # UPLOAD FILE
 # ==========================================
 
+
 @app.post("/files/upload")
 async def upload_file(
     file: UploadFile = File(...),
-    peer_id: str = Form(default="")
+    peer_id: str = Form(default=""),
+    current_user: dict = Depends(get_current_user)
 ):
-
     files_collection = get_files_collection()
 
     file_id = str(uuid4())
@@ -796,37 +846,28 @@ async def upload_file(
     original_name = Path(original_name).name
 
     extension = Path(original_name).suffix
-
     stored_filename = f"{file_id}{extension}"
-
     file_path = UPLOAD_DIR / stored_filename
 
     sha256_hash = hashlib.sha256()
-
     file_size = 0
 
     try:
-
         # Save file and calculate hash
         with open(file_path, "wb") as destination:
-
             while True:
-
-                chunk = await file.read(
-                    1024 * 1024
-                )
+                chunk = await file.read(1024 * 1024)
 
                 if not chunk:
                     break
 
                 destination.write(chunk)
-
                 sha256_hash.update(chunk)
-
                 file_size += len(chunk)
 
         file_data = {
             "id": file_id,
+            "owner_id": current_user["id"],
             "filename": original_name,
             "stored_filename": stored_filename,
             "peer_id": peer_id,
@@ -856,7 +897,6 @@ async def upload_file(
         }
 
     except PyMongoError:
-
         if file_path.exists():
             file_path.unlink()
 
@@ -866,7 +906,6 @@ async def upload_file(
         )
 
     except OSError:
-
         if file_path.exists():
             file_path.unlink()
 
@@ -876,7 +915,6 @@ async def upload_file(
         )
 
     finally:
-
         await file.close()
 
 
@@ -884,16 +922,17 @@ async def upload_file(
 # LIST UPLOADED FILES
 # ==========================================
 
-@app.get("/files")
-def get_files():
 
+@app.get("/files")
+def get_files(
+    current_user: dict = Depends(get_current_user)
+):
     collection = get_files_collection()
 
     try:
-
         return list(
             collection.find(
-                {},
+                {"owner_id": current_user["id"]},
                 {
                     "_id": 0,
                     "stored_filename": 0
@@ -902,30 +941,32 @@ def get_files():
         )
 
     except PyMongoError:
-
         raise HTTPException(
             status_code=500,
             detail="Could not retrieve files."
         )
 
 
+
 # ==========================================
 # DOWNLOAD FILE
 # ==========================================
 
-@app.get("/files/{file_id}/download")
-def download_file(file_id: str):
 
+@app.get("/files/{file_id}/download")
+def download_file(
+    file_id: str,
+    current_user: dict = Depends(get_current_user)
+):
     collection = get_files_collection()
 
     try:
-
         file_data = collection.find_one({
-            "_id": file_id
+            "_id": file_id,
+            "owner_id": current_user["id"]
         })
 
         if not file_data:
-
             raise HTTPException(
                 status_code=404,
                 detail="File not found."
@@ -937,7 +978,6 @@ def download_file(file_id: str):
         )
 
         if not file_path.is_file():
-
             raise HTTPException(
                 status_code=404,
                 detail="File is missing from server storage."
@@ -953,30 +993,30 @@ def download_file(file_id: str):
         )
 
     except PyMongoError:
-
         raise HTTPException(
             status_code=500,
             detail="Could not retrieve file information."
         )
 
-
 # ==========================================
 # VERIFY FILE INTEGRITY USING SHA-256
 # ==========================================
 
-@app.get("/files/{file_id}/verify")
-def verify_file(file_id: str):
 
+@app.get("/files/{file_id}/verify")
+def verify_file(
+    file_id: str,
+    current_user: dict = Depends(get_current_user)
+):
     collection = get_files_collection()
 
     try:
-
         file_data = collection.find_one({
-            "_id": file_id
+            "_id": file_id,
+            "owner_id": current_user["id"]
         })
 
         if not file_data:
-
             raise HTTPException(
                 status_code=404,
                 detail="File not found."
@@ -988,7 +1028,6 @@ def verify_file(file_id: str):
         )
 
         if not file_path.is_file():
-
             raise HTTPException(
                 status_code=404,
                 detail="File is missing from server storage."
@@ -997,31 +1036,22 @@ def verify_file(file_id: str):
         sha256_hash = hashlib.sha256()
 
         with open(file_path, "rb") as uploaded_file:
-
             for chunk in iter(
-                lambda: uploaded_file.read(
-                    1024 * 1024
-                ),
+                lambda: uploaded_file.read(1024 * 1024),
                 b""
             ):
-
                 sha256_hash.update(chunk)
 
         current_hash = sha256_hash.hexdigest()
-
         original_hash = file_data["sha256"]
 
-        is_valid = (
-            current_hash == original_hash
-        )
+        is_valid = current_hash == original_hash
 
         return {
             "file_id": file_id,
             "filename": file_data["filename"],
             "integrity": (
-                "Verified"
-                if is_valid
-                else "Failed"
+                "Verified" if is_valid else "Failed"
             ),
             "is_valid": is_valid,
             "original_sha256": original_hash,
@@ -1029,7 +1059,6 @@ def verify_file(file_id: str):
         }
 
     except PyMongoError:
-
         raise HTTPException(
             status_code=500,
             detail="Could not verify file information."

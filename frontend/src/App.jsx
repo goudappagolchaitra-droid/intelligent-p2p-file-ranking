@@ -40,7 +40,23 @@ import ForgotPasswordPage from "./pages/ForgotPassword";
 // const API = "http://127.0.0.1:8000";
 const API =
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+// ==========================================
+// AUTHENTICATED API REQUEST HELPER
+// ==========================================
 
+async function authFetch(url, options = {}) {
+  const token = localStorage.getItem("peerrank_access_token");
+
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      ...(token
+        ? { Authorization: `Bearer ${token}` }
+        : {})
+    }
+  });
+}
 // ==========================================
 // TRANSFER HISTORY HELPER
 // ==========================================
@@ -244,9 +260,9 @@ function Dashboard() {
       setLoading(true);
 
       const [filesResponse, peersResponse] = await Promise.all([
-        fetch(`${API}/files`),
-        fetch(`${API}/peers`)
-      ]);
+  authFetch(`${API}/files`),
+  authFetch(`${API}/peers`)
+]);
 
       if (!filesResponse.ok || !peersResponse.ok) {
         throw new Error("Could not load dashboard data.");
@@ -369,7 +385,8 @@ const profileImage = localStorage.getItem(
       setLoading(true);
       setError("");
 
-      const response = await fetch(`${API}/files`);
+      // const response = await fetch(`${API}/files`);
+      const response = await authFetch(`${API}/files`);
 
       if (!response.ok) {
         throw new Error("Could not load files from backend.");
@@ -409,7 +426,8 @@ const profileImage = localStorage.getItem(
         formData.append("file", selectedFile);
         formData.append("peer_id", "");
 
-        const response = await fetch(`${API}/files/upload`, {
+        // const response = await fetch(`${API}/files/upload`, {
+        const response = await authFetch(`${API}/files/upload`, {
           method: "POST",
           body: formData
         });
@@ -452,9 +470,9 @@ const profileImage = localStorage.getItem(
       setError("");
       setMessage("");
 
-      const response = await fetch(
-        `${API}/files/${file.id}/download`
-      );
+      const response = await authFetch(
+  `${API}/files/${file.id}/download`
+);
 
       if (!response.ok) {
         throw new Error("Download failed.");
@@ -498,9 +516,9 @@ const profileImage = localStorage.getItem(
       setError("");
       setMessage("");
 
-      const response = await fetch(
-        `${API}/files/${file.id}/verify`
-      );
+      const response = await authFetch(
+  `${API}/files/${file.id}/verify`
+);
 
       const result = await response.json();
 
@@ -703,7 +721,8 @@ function Peers() {
       setLoading(true);
       setError("");
 
-      const response = await fetch(`${API}/peers`);
+      // const response = await fetch(`${API}/peers`);
+      const response = await authFetch(`${API}/peers`);
 
       if (!response.ok) {
         throw new Error("Unable to load peers.");
@@ -809,7 +828,8 @@ function Ranking() {
     try {
       setError("");
 
-      const response = await fetch(`${API}/peers/ranking`);
+      // const response = await authFetch(`${API}/peers/ranking`);
+      const response = await authFetch(`${API}/peers/ranking`);
 
       if (!response.ok) {
         throw new Error("Unable to load peer ranking.");
@@ -1072,7 +1092,8 @@ function NetworkMonitor() {
       setLoading(true);
       setError("");
 
-      const response = await fetch(`${API}/peers`);
+      // const response = await fetch(`${API}/peers`);
+      const response = await authFetch(`${API}/peers`);
 
       if (!response.ok) {
         throw new Error("Unable to connect to the peer backend.");
