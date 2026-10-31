@@ -1034,27 +1034,28 @@ def get_peers(
 # GET ONLINE PEER RANKINGS
 # ==========================================
 
+
 @app.get("/peers/ranking")
 def get_ranking(
     current_user: dict = Depends(get_current_user)
 ):
-
     collection = get_peers_collection()
 
     try:
-
         now = datetime.now(timezone.utc)
 
         peers = list(
-            collection.find(
-                {},
-                {"_id": 0}
-            )
+            collection.find({})
         )
 
         ranked = []
 
         for peer in peers:
+            # Browser peers may store their ID only in MongoDB _id.
+            peer_id = peer.get("id") or str(peer.get("_id", ""))
+
+            if not peer_id:
+                continue
 
             last_seen = peer.get("last_seen")
 
@@ -1062,19 +1063,19 @@ def get_ranking(
                 continue
 
             try:
-
-                last_seen_time = datetime.fromisoformat(
-                    last_seen
-                )
+                if isinstance(last_seen, datetime):
+                    last_seen_time = last_seen
+                else:
+                    last_seen_time = datetime.fromisoformat(
+                        str(last_seen).replace("Z", "+00:00")
+                    )
 
                 if last_seen_time.tzinfo is None:
-
                     last_seen_time = last_seen_time.replace(
                         tzinfo=timezone.utc
                     )
 
             except (ValueError, TypeError):
-
                 continue
 
             elapsed = (
@@ -1082,28 +1083,24 @@ def get_ranking(
             ).total_seconds()
 
             if elapsed > 60:
-
-                peer["status"] = "Offline"
-
                 collection.update_one(
-                    {"id": peer["id"]},
-                    {
-                        "$set": {
-                            "status": "Offline"
-                        }
-                    }
+                    {"_id": peer.get("_id")},
+                    {"$set": {"status": "Offline"}}
                 )
-
                 continue
 
+            peer["id"] = peer_id
             peer["status"] = "Online"
 
             scores = calculate_peer_score(peer)
 
-            result = peer.copy()
+            result = {
+                key: value
+                for key, value in peer.items()
+                if key != "_id"
+            }
 
             result["score"] = scores["final_score"]
-
             result["performance"] = scores
 
             ranked.append(result)
@@ -1114,19 +1111,18 @@ def get_ranking(
             reverse=True
         )
 
-        # Assign ranks
+        # Assign rank numbers
         for index, peer in enumerate(ranked):
-
             peer["rank"] = index + 1
 
         return ranked
 
     except PyMongoError:
-
         raise HTTPException(
             status_code=500,
             detail="Could not retrieve peer rankings."
         )
+
 
 
 # ==========================================
