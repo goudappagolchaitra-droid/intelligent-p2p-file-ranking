@@ -1,0 +1,26 @@
+(
+echo # Secrets
+echo .env
+echo .env.*
+echo !.env.example
+echo.
+echo # Python
+echo venv/
+echo __pycache__/
+echo *.pyc
+echo .pytest_cache/
+echo.
+echo # Node
+echo node_modules/
+echo dist/
+echo dist-ssr/
+echo *.local
+echo.
+echo # Uploads
+echo backend/uploads/
+echo uploads/
+echo.
+echo # Editors
+echo .vscode/
+echo .idea/
+) > .gitignore
