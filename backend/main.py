@@ -15,7 +15,9 @@ from fastapi import (
     File,
     Form,
     Depends,
-        Header
+    Header,
+    WebSocket,
+    WebSocketDisconnect
 )
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -48,8 +50,217 @@ app = FastAPI(
     title="PeerRank API",
     version="2.2.0"
 )
+# ==========================================
+# WEBRTC SIGNALING MANAGER
+# ==========================================
+
+class SignalingManager:
+
+    def __init__(self):
+        self.connections = {}
+
+    async def connect(self, peer_id: str, websocket: WebSocket):
+        self.connections[peer_id] = websocket
+
+    def disconnect(self, peer_id: str, websocket: WebSocket):
+        if self.connections.get(peer_id) is websocket:
+            self.connections.pop(peer_id, None)
+
+    async def send_to_peer(self, peer_id: str, message: dict):
+
+        websocket = self.connections.get(peer_id)
+
+        if not websocket:
+            return False
+
+        await websocket.send_json(message)
+        return True
 
 
+signaling_manager = SignalingManager()
+# ==========================================
+# WEBRTC SIGNALING WEBSOCKET
+# ==========================================
+
+@app.websocket("/ws/signaling")
+async def websocket_signaling(websocket: WebSocket):
+
+    await websocket.accept()
+
+    peer_id = None
+
+    try:
+        # First message must authenticate the browser
+        auth_data = await websocket.receive_json()
+
+        if auth_data.get("type") != "auth":
+            await websocket.close(code=1008)
+            return
+
+        token = auth_data.get("token")
+        device_id = auth_data.get("device_id")
+
+        if not isinstance(token, str) or not isinstance(device_id, str):
+            await websocket.close(code=1008)
+            return
+
+        if not 16 <= len(device_id) <= 100:
+            await websocket.close(code=1008)
+            return
+
+        # Verify JWT
+        payload = jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM]
+        )
+
+        user_id = payload.get("sub")
+
+        if not user_id:
+            await websocket.close(code=1008)
+            return
+
+        # Verify user exists
+        user = get_users_collection().find_one({
+            "id": user_id
+        })
+
+        if not user:
+            await websocket.close(code=1008)
+            return
+
+        # Identify this browser
+        peer_id = str(
+            uuid5(
+                NAMESPACE_URL,
+                f"peerrank:{user_id}:{device_id}"
+            )
+        )
+
+        # Ensure this browser is registered
+        peer = get_peers_collection().find_one({
+            "_id": peer_id,
+            "owner_id": user_id
+        })
+
+        if not peer:
+            await websocket.close(code=1008)
+            return
+
+        await signaling_manager.connect(peer_id, websocket)
+
+        await websocket.send_json({
+            "type": "ready",
+            "peer_id": peer_id
+        })
+
+        # Receive signaling messages
+        while True:
+
+            message = await websocket.receive_json()
+
+            message_type = message.get("type")
+            target_peer_id = message.get("target_peer_id")
+            signal_payload = message.get("payload")
+
+            allowed_types = [
+                "offer",
+                "answer",
+                "ice-candidate"
+            ]
+
+            if message_type not in allowed_types:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Invalid signaling message type."
+                })
+                continue
+
+            if not isinstance(target_peer_id, str):
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Invalid target peer."
+                })
+                continue
+
+            if not isinstance(signal_payload, dict):
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Invalid signaling payload."
+                })
+                continue
+
+            # Verify target peer
+            target = get_peers_collection().find_one({
+                "_id": target_peer_id
+            })
+
+            if not target:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Target peer not found."
+                })
+                continue
+
+            # Check target's last heartbeat
+            last_seen = target.get("last_seen")
+
+            if isinstance(last_seen, str):
+                last_seen = datetime.fromisoformat(
+                    last_seen.replace("Z", "+00:00")
+                )
+
+            if not isinstance(last_seen, datetime):
+                continue
+
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(
+                    tzinfo=timezone.utc
+                )
+
+            elapsed = (
+                datetime.now(timezone.utc) - last_seen
+            ).total_seconds()
+
+            if elapsed > 60:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Target peer is offline."
+                })
+                continue
+
+            # Forward message to target browser
+            delivered = await signaling_manager.send_to_peer(
+                target_peer_id,
+                {
+                    "type": message_type,
+                    "from_peer_id": peer_id,
+                    "payload": signal_payload
+                }
+            )
+
+            await websocket.send_json({
+                "type": "sent" if delivered else "error",
+                "message": (
+                    "Signaling message delivered."
+                    if delivered
+                    else "Target browser is not connected."
+                )
+            })
+
+    except WebSocketDisconnect:
+        pass
+
+    except jwt.InvalidTokenError:
+        await websocket.close(code=1008)
+
+    except (ValueError, TypeError):
+        await websocket.close(code=1008)
+
+    finally:
+        if peer_id:
+            signaling_manager.disconnect(peer_id, websocket)
 # ==========================================
 # PASSWORD SECURITY
 # ==========================================
