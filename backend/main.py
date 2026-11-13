@@ -149,6 +149,8 @@ async def websocket_signaling(websocket: WebSocket):
             return
 
         await signaling_manager.connect(peer_id, websocket)
+        print("SIGNALING PEER CONNECTED:", peer_id)
+
 
         await websocket.send_json({
             "type": "ready",
@@ -231,6 +233,11 @@ async def websocket_signaling(websocket: WebSocket):
                 continue
 
             # Forward message to target browser
+            print("SIGNALING MESSAGE TYPE:", message_type)
+            print("SENDER PEER ID:", peer_id)
+            print("TARGET PEER ID:", target_peer_id)
+            print("TARGET CONNECTED:", target_peer_id in signaling_manager.connections)
+            
             delivered = await signaling_manager.send_to_peer(
                 target_peer_id,
                 {
@@ -703,19 +710,32 @@ class PeerRegistration(BaseModel):
 # ==========================================
 # BROWSER PEER MODEL
 # ==========================================
-
 class BrowserPeerHeartbeat(BaseModel):
-
-    device_id: str = Field(
-        min_length=16,
-        max_length=100
-    )
+    device_id: str = Field(min_length=16, max_length=100)
 
     peer_name: str = Field(
         default="Browser peer",
         min_length=2,
         max_length=100
     )
+
+    discoverable: bool = True
+
+    response_time_ms: float = Field(
+        default=0,
+        ge=0,
+        le=60000
+    )
+    upload_speed_mbps: float = Field(
+    default=0,
+    ge=0,
+    le=100000
+)
+
+# ==========================================
+# AUTOMATIC BROWSER PEER REGISTRATION
+# ==========================================
+
 
 # ==========================================
 # PEER PERFORMANCE SCORE
@@ -744,10 +764,7 @@ def calculate_peer_score(peer):
     )
 
     # Individual scores
-    latency_score = max(
-        0,
-        100 - response_time
-    )
+    latency_score = 100 / (1 + response_time / 100)
 
     speed_score = min(
         100,
@@ -825,64 +842,13 @@ def register_peer(
 # PEER HEARTBEAT
 # ==========================================
 
-@app.post("/peers/heartbeat/{peer_id}")
-def peer_heartbeat(
-    peer_id: str,
-    agent_authenticated: bool = Depends(verify_peer_agent)
-):
-
-    collection = get_peers_collection()
-
-    try:
-
-        current_time = datetime.now(
-            timezone.utc
-        ).isoformat()
-
-        result = collection.update_one(
-            {"_id": peer_id},
-            {
-                "$set": {
-                    "status": "Online",
-                    "last_seen": current_time
-                }
-            }
-        )
-
-        if result.matched_count == 0:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Peer not found."
-            )
-
-        return {
-            "message": "Heartbeat received successfully",
-            "peer_id": peer_id,
-            "status": "Online",
-            "last_seen": current_time
-        }
-
-    except PyMongoError:
-
-        raise HTTPException(
-            status_code=500,
-            detail="Could not update peer heartbeat."
-        )
-
-# ==========================================
-# AUTOMATIC BROWSER PEER REGISTRATION
-# ==========================================
-
 @app.post("/peers/browser/heartbeat")
 def browser_peer_heartbeat(
     data: BrowserPeerHeartbeat,
     current_user: dict = Depends(get_current_user)
 ):
-
     collection = get_peers_collection()
 
-    # Generate a stable peer ID for this user's browser
     peer_id = str(
         uuid5(
             NAMESPACE_URL,
@@ -890,17 +856,16 @@ def browser_peer_heartbeat(
         )
     )
 
-    current_time = datetime.now(
-        timezone.utc
-    ).isoformat()
+    current_time = datetime.now(timezone.utc).isoformat()
 
     peer = {
         "id": peer_id,
         "owner_id": current_user["id"],
         "device_id": data.device_id,
         "peer_name": data.peer_name.strip(),
-        "response_time_ms": 0,
-        "upload_speed_mbps": 0,
+        "discoverable": data.discoverable,
+        "response_time_ms": data.response_time_ms,
+        "upload_speed_mbps": data.upload_speed_mbps,
         "availability": 100,
         "active_transfers": 0,
         "status": "Online",
@@ -908,7 +873,6 @@ def browser_peer_heartbeat(
     }
 
     try:
-
         collection.update_one(
             {"_id": peer_id},
             {
@@ -929,13 +893,13 @@ def browser_peer_heartbeat(
             "peer": {
                 "id": peer_id,
                 "peer_name": peer["peer_name"],
+                "discoverable": peer["discoverable"],
                 "status": "Online",
                 "last_seen": current_time
             }
         }
 
     except PyMongoError:
-
         raise HTTPException(
             status_code=500,
             detail="Could not register browser peer."
@@ -946,13 +910,20 @@ def browser_peer_heartbeat(
 # ==========================================
 
 
+# ==========================================
+# GET ALL DISCOVERABLE PEERS
+# UPDATE ONLINE / OFFLINE STATUS
+# ==========================================
+
 @app.get("/peers")
 def get_peers(
     current_user: dict = Depends(get_current_user)
 ):
+
     collection = get_peers_collection()
 
     try:
+
         now = datetime.now(timezone.utc)
 
         peers = list(
@@ -967,7 +938,8 @@ def get_peers(
                     "availability": 1,
                     "active_transfers": 1,
                     "status": 1,
-                    "last_seen": 1
+                    "last_seen": 1,
+                    "discoverable": 1
                 }
             )
         )
@@ -975,13 +947,21 @@ def get_peers(
         public_peers = []
 
         for peer in peers:
+
+            # Hide peers that opted out of discovery.
+            # Older records remain discoverable by default.
+            if peer.get("discoverable", True) is False:
+                continue
+
             peer_id = peer.get("id") or str(peer["_id"])
 
             last_seen = peer.get("last_seen")
             status = "Unknown"
 
             if last_seen:
+
                 try:
+
                     if isinstance(last_seen, datetime):
                         last_seen_time = last_seen
                     else:
@@ -999,7 +979,8 @@ def get_peers(
                     ).total_seconds()
 
                     status = (
-                        "Online" if elapsed <= 60 else "Offline"
+                        "Online" if 0 <= elapsed <= 60
+                        else "Offline"
                     )
 
                     collection.update_one(
@@ -1012,54 +993,62 @@ def get_peers(
 
             public_peers.append({
                 "id": peer_id,
-                "peer_name": peer.get("peer_name", "Unknown peer"),
-                "response_time_ms": peer.get("response_time_ms", 0),
-                "upload_speed_mbps": peer.get("upload_speed_mbps", 0),
-                "availability": peer.get("availability", 0),
-                "active_transfers": peer.get("active_transfers", 0),
+                "peer_name": peer.get(
+                    "peer_name",
+                    "Unknown peer"
+                ),
+                "response_time_ms": peer.get(
+                    "response_time_ms",
+                    0
+                ),
+                "upload_speed_mbps": peer.get(
+                    "upload_speed_mbps",
+                    0
+                ),
+                "availability": peer.get(
+                    "availability",
+                    0
+                ),
+                "active_transfers": peer.get(
+                    "active_transfers",
+                    0
+                ),
                 "status": status,
-                "last_seen": last_seen
+                "last_seen": last_seen,
+                "discoverable": peer.get(
+                    "discoverable",
+                    True
+                )
             })
 
         return public_peers
 
     except PyMongoError:
+
         raise HTTPException(
             status_code=500,
             detail="Could not retrieve peers."
         )
-
-
 # ==========================================
 # GET ONLINE PEER RANKINGS
 # ==========================================
-
-
 @app.get("/peers/ranking")
-def get_ranking(
-    current_user: dict = Depends(get_current_user)
-):
+def get_ranking(current_user: dict = Depends(get_current_user)):
     collection = get_peers_collection()
+    now = datetime.now(timezone.utc)
 
     try:
-        now = datetime.now(timezone.utc)
-
-        peers = list(
-            collection.find({})
-        )
+        peers = list(collection.find({
+            "discoverable": {"$ne": False}
+        }))
 
         ranked = []
 
         for peer in peers:
-            # Browser peers may store their ID only in MongoDB _id.
             peer_id = peer.get("id") or str(peer.get("_id", ""))
-
-            if not peer_id:
-                continue
-
             last_seen = peer.get("last_seen")
 
-            if not last_seen:
+            if not peer_id or not last_seen:
                 continue
 
             try:
@@ -1078,40 +1067,33 @@ def get_ranking(
             except (ValueError, TypeError):
                 continue
 
-            elapsed = (
-                now - last_seen_time
-            ).total_seconds()
+            elapsed = (now - last_seen_time).total_seconds()
 
             if elapsed > 60:
                 collection.update_one(
-                    {"_id": peer.get("_id")},
+                    {"_id": peer["_id"]},
                     {"$set": {"status": "Offline"}}
                 )
                 continue
 
             peer["id"] = peer_id
-            peer["status"] = "Online"
-
             scores = calculate_peer_score(peer)
 
-            result = {
-                key: value
-                for key, value in peer.items()
-                if key != "_id"
-            }
+            ranked.append({
+                "id": peer_id,
+                "peer_name": peer.get("peer_name", "Browser peer"),
+                "status": "Online",
+                "response_time_ms": peer.get("response_time_ms", 0),
+                "upload_speed_mbps": peer.get("upload_speed_mbps", 0),
+                "availability": peer.get("availability", 0),
+                "active_transfers": peer.get("active_transfers", 0),
+                "score": scores["final_score"],
+                "performance": scores,
+                "last_seen": last_seen_time.isoformat(),
+            })
 
-            result["score"] = scores["final_score"]
-            result["performance"] = scores
+        ranked.sort(key=lambda peer: peer["score"], reverse=True)
 
-            ranked.append(result)
-
-        # Highest score first
-        ranked.sort(
-            key=lambda peer: peer["score"],
-            reverse=True
-        )
-
-        # Assign rank numbers
         for index, peer in enumerate(ranked):
             peer["rank"] = index + 1
 
@@ -1122,7 +1104,6 @@ def get_ranking(
             status_code=500,
             detail="Could not retrieve peer rankings."
         )
-
 
 
 # ==========================================

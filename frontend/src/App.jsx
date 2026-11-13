@@ -735,6 +735,15 @@ function Peers() {
       }
 
       const data = await response.json();
+      // console.log("PEERRANK PEER LIST:", data);
+      console.log(
+  "PEERRANK PEER LIST:",
+  JSON.stringify(data, null, 2)
+);
+console.log(
+  "CURRENT DEVICE ID:",
+  localStorage.getItem("peerrank_device_id")
+);
       setPeers(Array.isArray(data) ? data : data.peers || []);
 
     } catch (err) {
@@ -747,7 +756,8 @@ function Peers() {
   useEffect(() => {
     loadPeers();
 
-    const interval = setInterval(loadPeers, 10000);
+    // const interval = setInterval(loadPeers, 10000);
+    const interval = setInterval(loadPeers, 60000);
 
     return () => clearInterval(interval);
   }, []);
@@ -759,7 +769,7 @@ function Peers() {
       const updated = {};
 
       peers.forEach((peer) => {
-        const peerId = peer.id || peer.peer_id;
+        const peerId = peer.peer_id || peer.device_id || peer.id;
 
         if (peerId) {
           updated[peerId] =
@@ -778,21 +788,40 @@ function Peers() {
   return () => clearInterval(interval);
 }, [peers]);
 
-  async function connectPeer(peerId) {
-    try {
-      setMessage(`Connecting to ${peerId}...`);
+  
+async function connectPeer(peerId) {
+  try {
+    setMessage(`Connecting to ${peerId}...`);
 
-      if (!window.peerrankConnectToPeer) {
-        throw new Error("PeerRank connection service is not ready.");
-      }
-
-      await window.peerrankConnectToPeer(peerId);
-
-      setMessage("Connection request sent. Wait until WebRTC shows connected.");
-    } catch (err) {
-      setMessage(`Connection failed: ${err.message}`);
+    if (!window.peerrankConnectToPeer) {
+      throw new Error("PeerRank connection service is not ready.");
     }
+
+    await window.peerrankConnectToPeer(peerId);
+
+    // Wait up to 30 seconds for WebRTC connection
+    let attempts = 0;
+
+    const checkConnection = setInterval(() => {
+      attempts++;
+
+      const isConnected =
+        window.peerrankIsConnectedToPeer &&
+        window.peerrankIsConnectedToPeer(peerId);
+
+      if (isConnected) {
+        clearInterval(checkConnection);
+        setMessage(`Connected to ${peerId}. You can send files now.`);
+      } else if (attempts >= 30) {
+        clearInterval(checkConnection);
+        setMessage("Connection timed out. Check the other peer and try again.");
+      }
+    }, 1000);
+
+  } catch (err) {
+    setMessage(`Connection failed: ${err.message}`);
   }
+}
 
   async function sendFile(peerId) {
     if (!selectedFile) {
@@ -885,12 +914,18 @@ function Peers() {
 
               <tbody>
                 {peers.map((peer, index) => {
-  const peerId = peer.id || peer.peer_id;
+  // const peerId = peer.id || peer.peer_id;
+  const peerId = peer.peer_id || peer.device_id || peer.id;
   const connectionState =
     connectionStates[peerId] || "not-connected";
 
   const isConnected = connectionState === "connected";
-  const isConnecting = connectionState === "connecting";
+const isConnecting = connectionState === "connecting";
+
+const isOnline =
+    String(peer.status || "").trim().toLowerCase() === "online" ||
+    peer.is_online === true ||
+    peer.online === true;
 
   const connectionLabel = {
     connected: "Connected",
@@ -932,8 +967,13 @@ function Peers() {
                       <td>
   <Button
     onClick={() => connectPeer(peerId)}
-    disabled={!peerId || isConnected || isConnecting}
-  >
+    disabled={
+        !peerId ||
+        !isOnline ||
+        isConnected ||
+        isConnecting
+    }
+>
     {isConnected
       ? "Connected"
       : isConnecting
@@ -941,17 +981,23 @@ function Peers() {
         : "Connect"}
   </Button>
 
-  <Button
-    onClick={() => sendFile(peerId)}
-    disabled={
-      !peerId ||
-      !selectedFile ||
-      !isConnected ||
-      sendingPeerId !== ""
-    }
-  >
-    {sendingPeerId === peerId ? "Sending..." : "Send File"}
-  </Button>
+ <Button
+  onClick={() => sendFile(peerId)}
+  disabled={
+    !peerId ||
+    !selectedFile ||
+    !isConnected ||
+    sendingPeerId !== ""
+  }
+>
+  {!selectedFile
+    ? "Select a File First"
+    : sendingPeerId === peerId
+      ? "Sending..."
+      : isConnected
+        ? "Send File"
+        : "Waiting for Connection"}
+</Button>
 </td>
                     </tr>
                   );
@@ -1869,6 +1915,8 @@ function Protected({ children }) {
 
 
 function BrowserPeerPresence() {
+  const [pendingIncomingOffer, setPendingIncomingOffer] = useState(null);
+
   useEffect(() => {
     let deviceId = localStorage.getItem("peerrank_device_id");
     let signalingSocket = null;
@@ -1879,6 +1927,8 @@ const pendingIceCandidates = new Map();
 const dataChannels = new Map();
 const incomingTransfers = new Map();
 const pendingOutgoingTransfers = new Map();
+const pendingIncomingOffers = new Map();
+
 let activeIncomingTransferId = null;
 
     const rtcConfiguration = {
@@ -1905,6 +1955,60 @@ let activeIncomingTransferId = null;
 
       pendingIceCandidates.delete(peerId);
     }
+    function acceptIncomingFile(transferId) {
+  const pending = pendingIncomingOffers.get(transferId);
+
+  if (!pending) return;
+
+  const { message, dataChannel } = pending;
+
+  if (dataChannel.readyState !== "open") {
+    console.error("Connection is no longer available.");
+    pendingIncomingOffers.delete(transferId);
+    setPendingIncomingOffer(null);
+    return;
+  }
+
+  activeIncomingTransferId = transferId;
+
+  incomingTransfers.set(transferId, {
+    fileName: message.fileName,
+    fileType: message.fileType,
+    fileSize: message.fileSize,
+    expectedHash: message.fileHash,
+    chunks: [],
+    receivedBytes: 0
+  });
+
+  dataChannel.send(JSON.stringify({
+    type: "file-accepted",
+    transferId
+  }));
+
+  console.log("File transfer accepted:", message.fileName);
+
+  pendingIncomingOffers.delete(transferId);
+  setPendingIncomingOffer(null);
+}
+
+function rejectIncomingFile(transferId) {
+  const pending = pendingIncomingOffers.get(transferId);
+
+  if (!pending) return;
+
+  pending.dataChannel.send(JSON.stringify({
+    type: "file-rejected",
+    transferId
+  }));
+
+  console.log("File rejected:", pending.message.fileName);
+
+  pendingIncomingOffers.delete(transferId);
+  setPendingIncomingOffer(null);
+}
+
+window.peerrankAcceptIncomingFile = acceptIncomingFile;
+window.peerrankRejectIncomingFile = rejectIncomingFile;
 function configureDataChannel(dataChannel, peerId) {
   dataChannel.binaryType = "arraybuffer";
 
@@ -1992,48 +2096,40 @@ if (message.type === "file-error") {
 }
 
       // Incoming file request
-      if (message.type === "file-offer") {
-        const accepted = window.confirm(
-          `Receive file "${message.fileName}"?\nSize: ${(
-            message.fileSize / (1024 * 1024)
-          ).toFixed(2)} MB`
-        );
+    
+// Incoming file request
+if (message.type === "file-offer") {
+  console.log("Incoming file offer:", message.fileName);
 
-        if (!accepted) {
-          dataChannel.send(JSON.stringify({
-            type: "file-rejected",
-            transferId: message.transferId
-          }));
-          return;
-        }
-        if (activeIncomingTransferId !== null) {
-  dataChannel.send(JSON.stringify({
-    type: "file-rejected",
-    transferId: message.transferId
-  }));
+  if (
+    activeIncomingTransferId !== null ||
+    pendingIncomingOffers.size > 0
+  ) {
+    console.log("File rejected because another transfer is active.");
 
-  console.log("Another file transfer is already active.");
-  return;
+    dataChannel.send(JSON.stringify({
+      type: "file-rejected",
+      transferId: message.transferId
+    }));
+
+    return;
+  }
+
+  pendingIncomingOffers.set(message.transferId, {
+    message,
+    dataChannel
+  });
+
+  setPendingIncomingOffer({
+    transferId: message.transferId,
+    fileName: message.fileName,
+    fileSize: message.fileSize,
+    peerId
+  });
+
+  console.log("Waiting for receiver to accept or reject.");
 }
-
-activeIncomingTransferId = message.transferId;
-
-        incomingTransfers.set(message.transferId, {
-          fileName: message.fileName,
-          fileType: message.fileType,
-          fileSize: message.fileSize,
-          expectedHash: message.fileHash,
-          chunks: [],
-          receivedBytes: 0
-        });
-
-        dataChannel.send(JSON.stringify({
-          type: "file-accepted",
-          transferId: message.transferId
-        }));
-
-        console.log("File transfer accepted:", message.fileName);
-      }
+ 
 
       // File transfer completed
       else if (message.type === "file-complete") {
@@ -2067,9 +2163,8 @@ activeIncomingTransferId = message.transferId;
           }));
 
           incomingTransfers.delete(message.transferId);
-          activeIncomingTransferId = null;
-          activeIncomingTransferId = null;
-          return;
+activeIncomingTransferId = null;
+return;
         }
 
         const downloadUrl = URL.createObjectURL(blob);
@@ -2156,60 +2251,67 @@ activeIncomingTransferId = null;
 
 
 async function connectToPeer(targetPeerId) {
-  if (
-    !signalingSocket ||
-    signalingSocket.readyState !== WebSocket.OPEN
-  ) {
-    console.error("Signaling server is not connected.");
-    return;
-  }
 
-  // Prevent duplicate connections to the same peer
-  const existingConnection = peerConnections.get(targetPeerId);
-
-  if (existingConnection) {
-    const state = existingConnection.connectionState;
-
-    if (state !== "failed" && state !== "closed") {
-      console.log(
-        "Connection already exists with:",
-        targetPeerId,
-        "State:",
-        state
-      );
-      return;
+    if (
+        !signalingSocket ||
+        signalingSocket.readyState !== WebSocket.OPEN
+    ) {
+        throw new Error(
+            "Signaling server is not connected. Please refresh and try again."
+        );
     }
 
-    existingConnection.close();
-    peerConnections.delete(targetPeerId);
-  }
+    // Get existing connection
+    const existingConnection = peerConnections.get(targetPeerId);
 
-  try {
-    const peerConnection = createPeerConnection(targetPeerId);
+    // Check whether already connected
+    if (
+        existingConnection &&
+        existingConnection.connectionState === "connected" &&
+        dataChannels.get(targetPeerId)?.readyState === "open"
+    ) {
+        console.log("Peer already connected:", targetPeerId);
+        return;
+    }
 
-    const dataChannel = peerConnection.createDataChannel(
-      "peerrank-files"
-    );
+    // Remove old failed connection
+    if (existingConnection) {
+        existingConnection.close();
+        peerConnections.delete(targetPeerId);
+        dataChannels.delete(targetPeerId);
+    }
 
-    configureDataChannel(dataChannel, targetPeerId);
+    try {
+        // Create new WebRTC connection
+        const peerConnection = createPeerConnection(targetPeerId);
 
-    const offer = await peerConnection.createOffer();
+        // Create file transfer channel
+        const dataChannel = peerConnection.createDataChannel(
+            "peerrank-files"
+        );
 
-    await peerConnection.setLocalDescription(offer);
+        configureDataChannel(dataChannel, targetPeerId);
 
-    signalingSocket.send(
-      JSON.stringify({
-        type: "offer",
-        target_peer_id: targetPeerId,
-        payload: peerConnection.localDescription
-      })
-    );
+        // Create offer
+        const offer = await peerConnection.createOffer();
 
-    console.log("WebRTC offer sent to:", targetPeerId);
+        await peerConnection.setLocalDescription(offer);
 
-  } catch (error) {
-    console.error("Could not connect to peer:", error);
-  }
+        // Send offer to selected peer
+        signalingSocket.send(
+            JSON.stringify({
+                type: "offer",
+                target_peer_id: targetPeerId,
+                payload: peerConnection.localDescription
+            })
+        );
+
+        console.log("Connection request sent:", targetPeerId);
+
+    } catch (error) {
+        console.error("Connection failed:", error);
+        throw error;
+    }
 }
 async function sendFileToPeer(file, targetPeerId) {
   if (!(file instanceof File)) {
@@ -2284,6 +2386,8 @@ async function sendFileToPeer(file, targetPeerId) {
     await acceptedPromise;
 
     console.log("Receiver accepted:", file.name);
+    // Start measuring verified file-transfer throughput
+const transferStartTime = performance.now();
 
     // Send file in 16 KB chunks
     const CHUNK_SIZE = 16 * 1024;
@@ -2324,6 +2428,7 @@ async function sendFileToPeer(file, targetPeerId) {
     console.log("All file chunks sent. Verifying receiver...");
 
    await completedPromise;
+   
 
 // Save sender-side transfer history
 saveTransfer(
@@ -2337,6 +2442,7 @@ console.log("File transferred and verified successfully:", file.name);
 
   } catch (error) {
     console.error("File transfer failed:", error);
+    throw error;
   } finally {
     pendingOutgoingTransfers.delete(transferId);
   }
@@ -2419,61 +2525,90 @@ window.peerrankGetPeerConnectionState = (peerId) => {
             );
             return;
           }
+          else if (message.type === "offer") {
+  const peerId = message.from_peer_id;
 
-          if (message.type === "offer") {
-            const peerConnection = createPeerConnection(
-              message.from_peer_id
-            );
+  try {
+    let peerConnection = peerConnections.get(peerId);
 
-            await peerConnection.setRemoteDescription(
-              new RTCSessionDescription(message.payload)
-            );
+    if (
+      !peerConnection ||
+      peerConnection.connectionState === "closed" ||
+      peerConnection.connectionState === "failed"
+    ) {
+      peerConnection = createPeerConnection(peerId);
+    }
 
-            await processPendingIceCandidates(
-              message.from_peer_id,
-              peerConnection
-            );
+    if (peerConnection.signalingState !== "stable") {
+      console.warn(
+        "Cannot process offer. Signaling state:",
+        peerConnection.signalingState
+      );
+      return;
+    }
 
-            const answer = await peerConnection.createAnswer();
+    await peerConnection.setRemoteDescription(
+      new RTCSessionDescription(message.payload)
+    );
 
-            await peerConnection.setLocalDescription(answer);
+    await processPendingIceCandidates(peerId, peerConnection);
 
-            signalingSocket.send(
-              JSON.stringify({
-                type: "answer",
-                target_peer_id: message.from_peer_id,
-                payload: peerConnection.localDescription
-              })
-            );
+    const answer = await peerConnection.createAnswer();
 
-            console.log(
-              "WebRTC answer sent to:",
-              message.from_peer_id
-            );
-          }
+    await peerConnection.setLocalDescription(answer);
 
-          else if (message.type === "answer") {
-            const peerConnection = peerConnections.get(
-              message.from_peer_id
-            );
+    signalingSocket.send(
+      JSON.stringify({
+        type: "answer",
+        target_peer_id: peerId,
+        payload: peerConnection.localDescription
+      })
+    );
 
-            if (!peerConnection) {
-              console.error("Connection for answer not found.");
-              return;
-            }
+    console.log("WebRTC answer sent successfully to:", peerId);
 
-            await peerConnection.setRemoteDescription(
-              new RTCSessionDescription(message.payload)
-            );
+  } catch (error) {
+    console.error("Error handling WebRTC offer:", error);
+  }
+}
 
-            await processPendingIceCandidates(
-              message.from_peer_id,
-              peerConnection
-            );
+          
+else if (message.type === "answer") {
+  const peerConnection = peerConnections.get(
+    message.from_peer_id
+  );
 
-            console.log("WebRTC answer received.");
-          }
+  if (!peerConnection) {
+    console.error("Connection for answer not found.");
+    return;
+  }
 
+  // Accept an answer only when a local offer is waiting.
+  if (peerConnection.signalingState !== "have-local-offer") {
+    console.warn(
+      "Ignoring duplicate or unexpected answer.",
+      "Peer:",
+      message.from_peer_id,
+      "State:",
+      peerConnection.signalingState
+    );
+    return;
+  }
+
+  await peerConnection.setRemoteDescription(
+    new RTCSessionDescription(message.payload)
+  );
+
+  await processPendingIceCandidates(
+    message.from_peer_id,
+    peerConnection
+  );
+
+  console.log("WebRTC answer received successfully.");
+}
+
+
+          
           else if (message.type === "ice-candidate") {
             const peerId = message.from_peer_id;
             const peerConnection = peerConnections.get(peerId);
@@ -2527,27 +2662,49 @@ window.peerrankGetPeerConnectionState = (peerId) => {
       if (!navigator.onLine) return;
 
       try {
-        const response = await authFetch(
-          `${API}/peers/browser/heartbeat`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              device_id: deviceId,
-              peer_name: "Browser device"
-            })
-          }
-        );
+  // Measure browser-to-server response time
+  const pingStart = performance.now();
 
-        if (!response.ok) {
-          console.error(
-            "Peer heartbeat failed:",
-            await response.text()
-          );
-          return;
-        }
+  const pingResponse = await fetch(`${API}/health`, {
+    method: "GET",
+    cache: "no-store"
+  });
+
+  if (!pingResponse.ok) {
+    throw new Error("Server health check failed");
+  }
+
+  const responseTimeMs = Math.round(
+    performance.now() - pingStart
+  );
+
+  console.log("Server response time:", responseTimeMs, "ms");
+
+  // Send heartbeat with measured response time
+  const response = await authFetch(
+    `${API}/peers/browser/heartbeat`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        device_id: deviceId,
+        peer_name: "Browser device",
+        discoverable: true,
+        response_time_ms: responseTimeMs,
+        upload_speed_mbps: window.peerUploadSpeedMbps || 0
+      })
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Peer heartbeat failed:",
+      await response.text()
+    );
+    return;
+  }
 
         console.log("PeerRank browser is online.");
 
@@ -2580,11 +2737,96 @@ window.peerrankGetPeerConnectionState = (peerId) => {
 
       delete window.peerrankSignalingSocket;
       delete window.peerrankConnectToPeer;
+      delete window.peerrankAcceptIncomingFile;
+delete window.peerrankRejectIncomingFile;
     };
 
   }, []);
 
-  return null;
+  return (
+    <>
+      {pendingIncomingOffer && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0, 0, 0, 0.65)",
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "center",
+            zIndex: 99999
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              color: "#222",
+              padding: "30px",
+              borderRadius: "12px",
+              width: "90%",
+              maxWidth: "420px",
+              boxShadow: "0 10px 35px rgba(0,0,0,0.3)"
+            }}
+          >
+            <h2>Incoming File Request</h2>
+
+            <p>Another peer wants to send you a file.</p>
+
+            <p>
+              <strong>File name:</strong>{" "}
+              {pendingIncomingOffer.fileName}
+            </p>
+
+            <p>
+              <strong>File size:</strong>{" "}
+              {(
+                pendingIncomingOffer.fileSize / (1024 * 1024)
+              ).toFixed(2)} MB
+            </p>
+
+            <p>
+              <strong>Sender Peer ID:</strong>{" "}
+              {pendingIncomingOffer.peerId}
+            </p>
+
+            <div
+              style={{
+                display: "flex",
+                gap: "12px",
+                marginTop: "25px"
+              }}
+            >
+              <button
+                className="btn btn-primary"
+                onClick={() =>
+                  window.peerrankAcceptIncomingFile(
+                    pendingIncomingOffer.transferId
+                  )
+                }
+              >
+                Accept
+              </button>
+
+              <button
+                className="btn"
+                style={{
+                  background: "#dc3545",
+                  color: "white"
+                }}
+                onClick={() =>
+                  window.peerrankRejectIncomingFile(
+                    pendingIncomingOffer.transferId
+                  )
+                }
+              >
+                Reject
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
 
 
