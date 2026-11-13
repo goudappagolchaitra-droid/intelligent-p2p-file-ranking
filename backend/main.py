@@ -512,6 +512,16 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+class ProfileUpdate(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    email: str
+
+
+class ChangePassword(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 
 # ==========================================
 # USER REGISTRATION
@@ -670,6 +680,156 @@ def get_my_account(
         "user": current_user
     }
 
+
+
+# ==========================================
+# GET COMPLETE USER PROFILE
+# ==========================================
+
+@app.get("/auth/profile")
+def get_profile(
+    current_user: dict = Depends(get_current_user)
+):
+    user = get_users_collection().find_one(
+        {"id": current_user["id"]},
+        {"_id": 0, "password_hash": 0}
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found."
+        )
+
+    peers = list(
+        get_peers_collection().find(
+            {"owner_id": current_user["id"]},
+            {
+                "_id": 1,
+                "peer_name": 1,
+                "device_id": 1,
+                "status": 1,
+                "last_seen": 1
+            }
+        )
+    )
+
+    return {
+        "user": user,
+        "devices": [
+            {
+                "peer_id": str(peer["_id"]),
+                "device_id": peer.get("device_id", ""),
+                "device_name": peer.get("peer_name", "Unknown device"),
+                "status": peer.get("status", "Unknown"),
+                "last_seen": peer.get("last_seen")
+            }
+            for peer in peers
+        ]
+    }
+
+
+# ==========================================
+# UPDATE USER PROFILE
+# ==========================================
+
+@app.put("/auth/profile")
+def update_profile(
+    data: ProfileUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    name = data.name.strip()
+    email = data.email.strip().lower()
+
+    if not name or not email:
+        raise HTTPException(
+            status_code=400,
+            detail="Name and email are required."
+        )
+
+    users = get_users_collection()
+
+    existing = users.find_one({
+        "email": email,
+        "id": {"$ne": current_user["id"]}
+    })
+
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="Email is already registered."
+        )
+
+    users.update_one(
+        {"id": current_user["id"]},
+        {
+            "$set": {
+                "name": name,
+                "email": email
+            }
+        }
+    )
+
+    return {
+        "message": "Profile updated successfully.",
+        "user": {
+            "id": current_user["id"],
+            "name": name,
+            "email": email
+        }
+    }
+
+
+# ==========================================
+# CHANGE PASSWORD
+# ==========================================
+
+@app.post("/auth/change-password")
+def change_password(
+    data: ChangePassword,
+    current_user: dict = Depends(get_current_user)
+):
+    users = get_users_collection()
+
+    user = users.find_one({
+        "id": current_user["id"]
+    })
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found."
+        )
+
+    if not password_hash.verify(
+        data.current_password,
+        user["password_hash"]
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Current password is incorrect."
+        )
+
+    if data.current_password == data.new_password:
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different."
+        )
+
+    users.update_one(
+        {"id": current_user["id"]},
+        {
+            "$set": {
+                "password_hash": password_hash.hash(
+                    data.new_password
+                )
+            }
+        }
+    )
+
+    return {
+        "message": "Password changed successfully."
+    }
 # ==========================================
 # HEALTH CHECK
 # ==========================================
@@ -810,14 +970,15 @@ def register_peer(
     peer_id = str(uuid4())
 
     peer = {
-        "id": peer_id,
-        **data.model_dump(),
-        "status": "Online",
-        "last_seen": datetime.now(
-            timezone.utc
-        ).isoformat()
-    }
-
+    "id": peer_id,
+    "owner_id": current_user["id"],
+    **data.model_dump(),
+    "peer_name": current_user["name"],
+    "status": "Online",
+    "last_seen": datetime.now(
+        timezone.utc
+    ).isoformat()
+}
     try:
 
         collection.insert_one({
@@ -862,7 +1023,8 @@ def browser_peer_heartbeat(
         "id": peer_id,
         "owner_id": current_user["id"],
         "device_id": data.device_id,
-        "peer_name": data.peer_name.strip(),
+        "peer_name": current_user["name"],
+        
         "discoverable": data.discoverable,
         "response_time_ms": data.response_time_ms,
         "upload_speed_mbps": data.upload_speed_mbps,
@@ -915,23 +1077,30 @@ def browser_peer_heartbeat(
 # UPDATE ONLINE / OFFLINE STATUS
 # ==========================================
 
+
+# ==========================================
+# GET ALL DISCOVERABLE PEERS
+# UPDATE ONLINE / OFFLINE STATUS
+# ==========================================
+
+
 @app.get("/peers")
 def get_peers(
     current_user: dict = Depends(get_current_user)
 ):
-
     collection = get_peers_collection()
 
     try:
-
         now = datetime.now(timezone.utc)
 
+        # Get all peers
         peers = list(
             collection.find(
                 {},
                 {
                     "_id": 1,
                     "id": 1,
+                    "owner_id": 1,
                     "peer_name": 1,
                     "response_time_ms": 1,
                     "upload_speed_mbps": 1,
@@ -944,12 +1113,29 @@ def get_peers(
             )
         )
 
+        # Get usernames from MongoDB
+        users = list(
+            get_users_collection().find(
+                {},
+                {
+                    "_id": 0,
+                    "id": 1,
+                    "name": 1
+                }
+            )
+        )
+
+        user_names = {
+            user["id"]: user["name"]
+            for user in users
+            if user.get("id") and user.get("name")
+        }
+
         public_peers = []
 
         for peer in peers:
 
-            # Hide peers that opted out of discovery.
-            # Older records remain discoverable by default.
+            # Skip peers that are not discoverable
             if peer.get("discoverable", True) is False:
                 continue
 
@@ -959,9 +1145,7 @@ def get_peers(
             status = "Unknown"
 
             if last_seen:
-
                 try:
-
                     if isinstance(last_seen, datetime):
                         last_seen_time = last_seen
                     else:
@@ -979,7 +1163,8 @@ def get_peers(
                     ).total_seconds()
 
                     status = (
-                        "Online" if 0 <= elapsed <= 60
+                        "Online"
+                        if 0 <= elapsed <= 60
                         else "Offline"
                     )
 
@@ -991,61 +1176,88 @@ def get_peers(
                 except (ValueError, TypeError):
                     status = "Unknown"
 
+            # Get account username using owner_id
+            owner_id = peer.get("owner_id")
+
+            display_name = user_names.get(
+                owner_id,
+                peer.get("peer_name", "Unknown peer")
+            )
+
             public_peers.append({
                 "id": peer_id,
-                "peer_name": peer.get(
-                    "peer_name",
-                    "Unknown peer"
-                ),
+                "peer_name": display_name,
                 "response_time_ms": peer.get(
-                    "response_time_ms",
-                    0
+                    "response_time_ms", 0
                 ),
                 "upload_speed_mbps": peer.get(
-                    "upload_speed_mbps",
-                    0
+                    "upload_speed_mbps", 0
                 ),
                 "availability": peer.get(
-                    "availability",
-                    0
+                    "availability", 0
                 ),
                 "active_transfers": peer.get(
-                    "active_transfers",
-                    0
+                    "active_transfers", 0
                 ),
                 "status": status,
                 "last_seen": last_seen,
                 "discoverable": peer.get(
-                    "discoverable",
-                    True
+                    "discoverable", True
                 )
             })
 
         return public_peers
 
     except PyMongoError:
-
         raise HTTPException(
             status_code=500,
             detail="Could not retrieve peers."
         )
+
 # ==========================================
 # GET ONLINE PEER RANKINGS
 # ==========================================
+
 @app.get("/peers/ranking")
-def get_ranking(current_user: dict = Depends(get_current_user)):
+def get_ranking(
+    current_user: dict = Depends(get_current_user)
+):
     collection = get_peers_collection()
     now = datetime.now(timezone.utc)
 
     try:
-        peers = list(collection.find({
-            "discoverable": {"$ne": False}
-        }))
+        peers = list(
+            collection.find({
+                "discoverable": {"$ne": False}
+            })
+        )
+
+        # Get usernames from MongoDB
+        users = list(
+            get_users_collection().find(
+                {},
+                {
+                    "_id": 0,
+                    "id": 1,
+                    "name": 1
+                }
+            )
+        )
+
+        user_names = {
+            user["id"]: user["name"]
+            for user in users
+            if user.get("id") and user.get("name")
+        }
 
         ranked = []
 
         for peer in peers:
-            peer_id = peer.get("id") or str(peer.get("_id", ""))
+
+            peer_id = peer.get("id") or str(
+                peer.get("_id", "")
+            )
+
             last_seen = peer.get("last_seen")
 
             if not peer_id or not last_seen:
@@ -1067,9 +1279,11 @@ def get_ranking(current_user: dict = Depends(get_current_user)):
             except (ValueError, TypeError):
                 continue
 
-            elapsed = (now - last_seen_time).total_seconds()
+            elapsed = (
+                now - last_seen_time
+            ).total_seconds()
 
-            if elapsed > 60:
+            if elapsed < 0 or elapsed > 60:
                 collection.update_one(
                     {"_id": peer["_id"]},
                     {"$set": {"status": "Offline"}}
@@ -1077,22 +1291,40 @@ def get_ranking(current_user: dict = Depends(get_current_user)):
                 continue
 
             peer["id"] = peer_id
+
             scores = calculate_peer_score(peer)
+
+            # Get account username
+            display_name = user_names.get(
+                peer.get("owner_id"),
+                peer.get("peer_name", "Unknown peer")
+            )
 
             ranked.append({
                 "id": peer_id,
-                "peer_name": peer.get("peer_name", "Browser peer"),
+                "peer_name": display_name,
                 "status": "Online",
-                "response_time_ms": peer.get("response_time_ms", 0),
-                "upload_speed_mbps": peer.get("upload_speed_mbps", 0),
-                "availability": peer.get("availability", 0),
-                "active_transfers": peer.get("active_transfers", 0),
+                "response_time_ms": peer.get(
+                    "response_time_ms", 0
+                ),
+                "upload_speed_mbps": peer.get(
+                    "upload_speed_mbps", 0
+                ),
+                "availability": peer.get(
+                    "availability", 0
+                ),
+                "active_transfers": peer.get(
+                    "active_transfers", 0
+                ),
                 "score": scores["final_score"],
                 "performance": scores,
-                "last_seen": last_seen_time.isoformat(),
+                "last_seen": last_seen_time.isoformat()
             })
 
-        ranked.sort(key=lambda peer: peer["score"], reverse=True)
+        ranked.sort(
+            key=lambda peer: peer["score"],
+            reverse=True
+        )
 
         for index, peer in enumerate(ranked):
             peer["rank"] = index + 1
@@ -1104,7 +1336,6 @@ def get_ranking(current_user: dict = Depends(get_current_user)):
             status_code=500,
             detail="Could not retrieve peer rankings."
         )
-
 
 # ==========================================
 # UPLOAD FILE
